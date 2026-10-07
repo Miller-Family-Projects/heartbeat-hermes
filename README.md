@@ -64,9 +64,12 @@ Watches live in `$HERMES_HOME/heartbeat/watches.json` and survive restarts.
 The scheduler is guarded by a cross-process file lock, so only one process
 runs it even if multiple Hermes surfaces load the plugin.
 
-The scheduler starts when the plugin registers, without waiting for an inbound
-message; repeated registration reuses the same scheduler and lock. Delivery
-prefers the runner captured by `pre_gateway_dispatch`, with a compatibility
+The scheduler starts when the plugin registers in a running gateway, without
+waiting for an inbound message; repeated registration reuses the same scheduler
+and lock. Registration requires an already-loaded `gateway.run` module and a
+runner with a running gateway loop; CLI and plugin-management processes do not
+claim the lock. The `pre_gateway_dispatch` capture also attempts to claim it.
+Delivery prefers the runner captured by `pre_gateway_dispatch`, with a compatibility
 fallback to Hermes' private `gateway.run._gateway_runner_ref` and the runner's
 `_gateway_loop`. An explicit delivery route is needed before the first inbound
 message; otherwise the first captured conversation remains the target. Findings

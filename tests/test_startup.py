@@ -6,6 +6,7 @@ import sys
 import threading
 import weakref
 from collections.abc import Iterator
+from functools import partial
 from pathlib import Path
 from types import ModuleType
 
@@ -95,6 +96,7 @@ def runner(monkeypatch: pytest.MonkeyPatch) -> Iterator[Runner]:
 
 
 def test_scheduler_evaluates_when_registered_without_inbound(
+    runner: Runner,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Given: a saved, due watch and no captured runner.
@@ -114,6 +116,7 @@ def test_scheduler_evaluates_when_registered_without_inbound(
 
 
 def test_repeated_registration_keeps_one_scheduler_and_lock(
+    runner: Runner,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Given: simultaneous initial registrations against the real file lock.
@@ -143,6 +146,63 @@ def test_repeated_registration_keeps_one_scheduler_and_lock(
     assert plugin._scheduler_thread is scheduler
     assert plugin._scheduler_lock_fd is lock
     assert attempts == [True]
+
+
+@pytest.mark.parametrize("module_loaded", [False, True])
+def test_registration_leaves_lock_available_when_gateway_is_not_running(
+    module_loaded: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Given: a CLI surface, possibly with gateway.run imported for shared helpers.
+    _install_fake_gateway_modules(monkeypatch)
+    monkeypatch.delitem(sys.modules, "gateway.run", raising=False)
+    if module_loaded:
+        module = ModuleType("gateway.run")
+        monkeypatch.setattr(module, "GatewayRunner", Runner, raising=False)
+        monkeypatch.setattr(module, "_gateway_runner_ref", lambda: None, raising=False)
+        monkeypatch.setitem(sys.modules, "gateway.run", module)
+    # When: that surface registers the plugin.
+    plugin.register(Context())
+    # Then: it neither starts scheduling nor takes the gateway's file lock.
+    assert not plugin._owns_scheduler_lock
+    assert plugin._scheduler_thread is None
+    assert plugin._scheduler_lock_fd is None
+    assert plugin._try_acquire_scheduler_lock()
+
+
+def test_registration_leaves_lock_available_when_gateway_loop_is_not_running(
+    runner: Runner,
+) -> None:
+    # Given: an imported runner whose loop is not running, not a started gateway.
+    with asyncio.Runner() as owner:
+        runner._gateway_loop = owner.get_loop()
+        # When: the plugin registers before gateway startup.
+        plugin.register(Context())
+    # Then: the process leaves scheduling ownership available.
+    assert not plugin._owns_scheduler_lock
+    assert plugin._scheduler_thread is None
+    assert plugin._try_acquire_scheduler_lock()
+
+
+def test_capture_claims_scheduler_when_registration_had_no_gateway(
+    runner: Runner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Given: registration without a live runner reference leaves the lock unclaimed.
+    monkeypatch.setattr(sys.modules["gateway.run"], "_gateway_runner_ref", lambda: None)
+    plugin.register(Context())
+    assert not plugin._owns_scheduler_lock
+    # When: pre_gateway_dispatch captures the gateway on its running loop.
+    runner._gateway_loop.call_soon_threadsafe(
+        partial(plugin._capture_gateway, gateway=runner)
+    )
+    # Then: capture owns the real scheduler lock and starts scheduling.
+    captured = threading.Event()
+    runner._gateway_loop.call_soon_threadsafe(captured.set)
+    assert captured.wait(timeout=2)
+    assert plugin._owns_scheduler_lock
+    assert plugin._scheduler_thread is not None
+    assert plugin._scheduler_thread.is_alive()
 
 
 def test_wake_uses_weakref_when_runner_not_captured(runner: Runner) -> None:

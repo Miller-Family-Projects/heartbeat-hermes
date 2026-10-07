@@ -391,6 +391,8 @@ def test_register_claims_scheduler_before_gateway_capture(monkeypatch: Any) -> N
 
     monkeypatch.setattr(plugin, "_try_acquire_scheduler_lock", lambda: True)
     monkeypatch.setattr(plugin, "_ensure_scheduler", _record_ensure)
+    monkeypatch.setitem(sys.modules, "gateway.run", ModuleType("gateway.run"))
+    monkeypatch.setattr(plugin, "_resolve_gateway", lambda: (SimpleNamespace(), SimpleNamespace()))
 
     class Ctx:
         def register_tool(self, **kwargs: Any) -> None:
@@ -421,6 +423,8 @@ def test_gateway_capture_retries_scheduler_lock_after_register_miss(monkeypatch:
 
     monkeypatch.setattr(plugin, "_try_acquire_scheduler_lock", _try_lock)
     monkeypatch.setattr(plugin, "_ensure_scheduler", _record_ensure)
+    monkeypatch.setitem(sys.modules, "gateway.run", ModuleType("gateway.run"))
+    monkeypatch.setattr(plugin, "_resolve_gateway", lambda: (SimpleNamespace(), SimpleNamespace()))
 
     class Ctx:
         def register_tool(self, **kwargs: Any) -> None:

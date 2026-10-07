@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -585,5 +586,6 @@ def register(ctx: Any) -> None:
         _routing = _pinned_routing
     _register_tools(ctx.register_tool)
     ctx.register_hook("pre_gateway_dispatch", _capture_gateway)
-    _claim_scheduler_if_available()
+    if sys.modules.get("gateway.run") is not None and _resolve_gateway() is not None:
+        _claim_scheduler_if_available()
     logger.info("heartbeat plugin registered")
