@@ -32,6 +32,8 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
+from .startup import GatewayWaiter, load_startup_timeout
+
 if TYPE_CHECKING:
     from gateway.run import GatewayRunner
 
@@ -55,6 +57,7 @@ _scheduler_lock_fd: Any = None
 _state_lock = threading.Lock()
 _scheduler_start_lock = threading.RLock()
 _runner_warning_active = False
+_startup_waiter: GatewayWaiter | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -580,12 +583,17 @@ def _load_pinned_routing() -> Optional[Dict[str, Any]]:
 
 def register(ctx: Any) -> None:
     """Register heartbeat tools and the gateway-capture hook."""
-    global _pinned_routing, _routing
+    global _pinned_routing, _routing, _startup_waiter
     _pinned_routing = _load_pinned_routing()
     if _pinned_routing is not None:
         _routing = _pinned_routing
     _register_tools(ctx.register_tool)
     ctx.register_hook("pre_gateway_dispatch", _capture_gateway)
-    if sys.modules.get("gateway.run") is not None and _resolve_gateway() is not None:
-        _claim_scheduler_if_available()
+    if sys.modules.get("gateway.run") is not None:
+        with _scheduler_start_lock:
+            if _startup_waiter is None:
+                _startup_waiter = GatewayWaiter(load_startup_timeout(), POLL_SECONDS)
+                _startup_waiter.start(
+                    lambda: _resolve_gateway() is not None, _claim_scheduler_if_available
+                )
     logger.info("heartbeat plugin registered")

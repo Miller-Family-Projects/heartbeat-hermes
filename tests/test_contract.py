@@ -177,7 +177,7 @@ def test_installed_directory_plugin_layout_imports(tmp_path: Path) -> None:
     # Given: package files copied into a flat Hermes directory-plugin layout.
     plugin_dir = tmp_path / "heartbeat-hermes"
     plugin_dir.mkdir()
-    for name in ["__init__.py", "plugin.py", "plugin.yaml", "py.typed"]:
+    for name in ["__init__.py", "plugin.py", "startup.py", "plugin.yaml", "py.typed"]:
         _ = (plugin_dir / name).write_text((PACKAGE / name).read_text(encoding="utf-8"))
     spec = importlib.util.spec_from_file_location(
         "heartbeat_hermes_installed_test",
