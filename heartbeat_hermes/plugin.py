@@ -29,7 +29,10 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
+
+if TYPE_CHECKING:
+    from gateway.run import GatewayRunner
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +52,8 @@ _scheduler_thread: Optional[threading.Thread] = None
 _scheduler_stop = threading.Event()
 _scheduler_lock_fd: Any = None
 _state_lock = threading.Lock()
+_scheduler_start_lock = threading.RLock()
+_runner_warning_active = False
 
 
 # ---------------------------------------------------------------------------
@@ -92,12 +97,40 @@ def _resolve_adapter(runner: Any, platform_value: str) -> Any:
     return None
 
 
+def _resolve_gateway() -> tuple[GatewayRunner, asyncio.AbstractEventLoop] | None:
+    """Prefer hook capture; compatibility fallback uses Hermes' private runner ref/loop.
+
+    Hermes exposes no runner-bearing startup hook. Keep private startup access
+    here so a missing reference or a not-yet-running loop leaves wakes pending.
+    """
+    if _gateway_runner is not None and _gateway_loop is not None:
+        return _gateway_runner, _gateway_loop
+    try:
+        from gateway import run
+
+        reference = getattr(run, "_gateway_runner_ref", None)
+        runner = reference() if callable(reference) else None
+        if not isinstance(runner, run.GatewayRunner):
+            return None
+        loop = getattr(runner, "_gateway_loop", None)
+        if loop is None or not loop.is_running():
+            return None
+        return runner, loop
+    except (ImportError, AttributeError, TypeError):
+        return None
+
+
 def _inject_wake(text: str) -> bool:
-    """Hand a synthetic internal event to the captured gateway runner."""
-    global _gateway_runner, _gateway_loop
-    if not _gateway_runner or not _gateway_loop or not _routing:
-        logger.warning("heartbeat: gateway/routing not captured yet, wake dropped: %s", text[:80])
+    """Hand a synthetic internal event to the available gateway runner."""
+    global _runner_warning_active
+    gateway = _resolve_gateway()
+    if gateway is None or not _routing:
+        if not _runner_warning_active:
+            logger.warning("heartbeat: gateway/routing unavailable, wake pending")
+            _runner_warning_active = True
         return False
+    _runner_warning_active = False
+    runner, loop = gateway
     try:
         from gateway.config import Platform
         from gateway.platforms.base import MessageEvent, MessageType
@@ -125,17 +158,17 @@ def _inject_wake(text: str) -> bool:
             source=source,
             internal=True,
         )
-        adapter = _resolve_adapter(_gateway_runner, platform_value)
+        adapter = _resolve_adapter(runner, platform_value)
         if adapter is None:
             logger.error("heartbeat: no adapter for platform %r", platform_value)
             return False
 
-        if not callable(getattr(_gateway_runner, "_handle_message", None)):
+        if not callable(getattr(runner, "_handle_message", None)):
             logger.error("heartbeat: captured gateway runner has no message handler")
             return False
 
         async def _deliver() -> None:
-            response_text = await _gateway_runner._handle_message(event)
+            response_text = await runner._handle_message(event)
             if response_text:
                 send_metadata = {"thread_id": source.thread_id} if source.thread_id else None
                 await adapter.send(
@@ -144,7 +177,7 @@ def _inject_wake(text: str) -> bool:
                     metadata=send_metadata,
                 )
 
-        future = asyncio.run_coroutine_threadsafe(_deliver(), _gateway_loop)
+        future = asyncio.run_coroutine_threadsafe(_deliver(), loop)
         future.result(timeout=15)
         logger.info("heartbeat: wake delivered: %s", text[:80])
         return True
@@ -187,18 +220,26 @@ def evaluate_watch(
         if now < float(watch.get("deadline", 0)):
             return "pending"
         note = str(watch.get("note") or f"Timer '{name}' expired.")
-        if not wake(f"[heartbeat: {name}] {note}"):
+        text = str(watch.get("pending_finding") or f"[heartbeat: {name}] {note}")
+        if not wake(text):
+            watch["pending_finding"] = text
             return "pending"
+        watch.pop("pending_finding", None)
         if watch.get("repeat"):
             watch["deadline"] = now + float(watch.get("seconds", 60))
             return "fired"
         return "remove"
 
-    finding = runner(str(watch.get("command", "")), float(watch.get("timeout", COMMAND_TIMEOUT_SECONDS)))
-    if not finding:
-        return "pending"
-    if wake(f"[heartbeat: {name}] {finding}"):
+    text = watch.get("pending_finding")
+    if not text:
+        finding = runner(str(watch.get("command", "")), float(watch.get("timeout", COMMAND_TIMEOUT_SECONDS)))
+        if not finding:
+            return "pending"
+        text = f"[heartbeat: {name}] {finding}"
+    if wake(str(text)):
+        watch.pop("pending_finding", None)
         return "remove" if watch.get("once") else "fired"
+    watch["pending_finding"] = text
     return "pending"
 
 
@@ -237,7 +278,8 @@ def _scheduler_loop() -> None:
                     if outcome == "remove":
                         del watches[name]
                     else:
-                        watch["next_run"] = now + float(watch.get("interval", 60))
+                        delay = POLL_SECONDS if watch.get("pending_finding") else float(watch.get("interval", 60))
+                        watch["next_run"] = now + delay
                         watches[name] = watch
                     dirty = True
                 if dirty:
@@ -261,29 +303,31 @@ def _try_acquire_scheduler_lock() -> bool:
 
 def _ensure_scheduler() -> None:
     global _scheduler_thread
-    if not _owns_scheduler_lock:
-        return
-    if _scheduler_thread and _scheduler_thread.is_alive():
-        return
-    _scheduler_stop.clear()
-    _scheduler_thread = threading.Thread(
-        target=_scheduler_loop,
-        name="heartbeat-scheduler",
-        daemon=True,
-    )
-    _scheduler_thread.start()
+    with _scheduler_start_lock:
+        if not _owns_scheduler_lock:
+            return
+        if _scheduler_thread and _scheduler_thread.is_alive():
+            return
+        _scheduler_stop.clear()
+        _scheduler_thread = threading.Thread(
+            target=_scheduler_loop,
+            name="heartbeat-scheduler",
+            daemon=True,
+        )
+        _scheduler_thread.start()
 
 
 def _claim_scheduler_if_available() -> bool:
     global _owns_scheduler_lock
-    if _owns_scheduler_lock:
+    with _scheduler_start_lock:
+        if _owns_scheduler_lock:
+            _ensure_scheduler()
+            return True
+        if not _try_acquire_scheduler_lock():
+            return False
+        _owns_scheduler_lock = True
         _ensure_scheduler()
         return True
-    if not _try_acquire_scheduler_lock():
-        return False
-    _owns_scheduler_lock = True
-    _ensure_scheduler()
-    return True
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +363,7 @@ def _capture_gateway(**kwargs: Any) -> None:
         return None
     platform = getattr(source, "platform", None)
     _routing = {
-        "platform": platform.value if hasattr(platform, "value") else str(platform or ""),
+        "platform": platform.value if platform is not None and hasattr(platform, "value") else str(platform or ""),
         "chat_id": getattr(source, "chat_id", "") or "",
         "chat_name": getattr(source, "chat_name", None),
         "chat_type": getattr(source, "chat_type", "dm") or "dm",
@@ -541,4 +585,5 @@ def register(ctx: Any) -> None:
         _routing = _pinned_routing
     _register_tools(ctx.register_tool)
     ctx.register_hook("pre_gateway_dispatch", _capture_gateway)
+    _claim_scheduler_if_available()
     logger.info("heartbeat plugin registered")

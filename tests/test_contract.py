@@ -216,7 +216,7 @@ def test_timer_watch_pending_before_deadline() -> None:
     watch = {"type": "timer", "deadline": time.time() + 3600}
 
     # When: the watch is evaluated.
-    outcome = evaluate_watch("later", watch, time.time(), wake=fired.append)
+    outcome = evaluate_watch("later", watch, time.time(), wake=_recorder(fired))
 
     # Then: nothing fires.
     assert outcome == "pending"
@@ -381,7 +381,7 @@ def test_scheduler_not_armed_without_lock() -> None:
     assert plugin._scheduler_thread is None
 
 
-def test_register_does_not_claim_scheduler_before_gateway_capture(monkeypatch: Any) -> None:
+def test_register_claims_scheduler_before_gateway_capture(monkeypatch: Any) -> None:
     # Given: registration happens in a process without a captured gateway runner.
     ensure_calls = 0
 
@@ -402,14 +402,14 @@ def test_register_does_not_claim_scheduler_before_gateway_capture(monkeypatch: A
     # When: the plugin registers its tools and hooks.
     register(Ctx())
 
-    # Then: it does not steal the singleton scheduler lock before gateway capture.
-    assert plugin._owns_scheduler_lock is False
-    assert ensure_calls == 0
+    # Then: evaluation is armed without waiting for an inbound message.
+    assert plugin._owns_scheduler_lock is True
+    assert ensure_calls == 1
 
 
 def test_gateway_capture_retries_scheduler_lock_after_register_miss(monkeypatch: Any) -> None:
     # Given: registration happens before this process can own the scheduler lock.
-    lock_results = iter([True])
+    lock_results = iter([False, True])
     ensure_calls = 0
 
     def _try_lock() -> bool:
