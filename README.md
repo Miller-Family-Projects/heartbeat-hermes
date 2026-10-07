@@ -64,11 +64,21 @@ Watches live in `$HERMES_HOME/heartbeat/watches.json` and survive restarts.
 The scheduler is guarded by a cross-process file lock, so only one process
 runs it even if multiple Hermes surfaces load the plugin.
 
-The scheduler starts when the plugin registers in a running gateway, without
-waiting for an inbound message; repeated registration reuses the same scheduler
-and lock. Registration requires an already-loaded `gateway.run` module and a
-runner with a running gateway loop; CLI and plugin-management processes do not
-claim the lock. The `pre_gateway_dispatch` capture also attempts to claim it.
+Registration can happen before the gateway publishes its runner or binds its
+loop. In a process with `gateway.run` already loaded, registration starts one
+lightweight daemon waiter. It checks readiness at the scheduler's existing
+5-second poll interval and claims the scheduler lock once the runner has a
+running loop, without waiting for an inbound message. An already-ready gateway
+claims immediately. Repeated registrations reuse the same waiter, scheduler,
+and lock. Processes without `gateway.run` loaded (such as CLI/plugin management)
+never start the waiter or claim the lock at registration.
+
+Set `plugins.entries.heartbeat-hermes.startup_timeout_seconds` in `config.yaml`
+to a positive, finite number of seconds (default: `120`). The waiter stops at
+that deadline, logging one warning; repeated registration does not restart the
+wait. Invalid values use the default with a warning. The existing
+`pre_gateway_dispatch` capture path still attempts to claim the scheduler,
+including after startup timeout or lock contention.
 Delivery prefers the runner captured by `pre_gateway_dispatch`, with a compatibility
 fallback to Hermes' private `gateway.run._gateway_runner_ref` and the runner's
 `_gateway_loop`. An explicit delivery route is needed before the first inbound
