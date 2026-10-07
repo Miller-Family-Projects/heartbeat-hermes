@@ -7,11 +7,17 @@ import logging
 import math
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from itertools import pairwise
 from typing import Final, Protocol, TypedDict, runtime_checkable
 
 logger = logging.getLogger(__name__)
 DEFAULT_STARTUP_TIMEOUT_SECONDS: Final = 120.0
+
+
+def gateway_start_requested(argv: Sequence[str]) -> bool:
+    """Recognize gateway startup even before the CLI imports gateway.run."""
+    return any(left == "gateway" and right == "run" for left, right in pairwise(argv))
 
 
 class StartupEntry(TypedDict, total=False):

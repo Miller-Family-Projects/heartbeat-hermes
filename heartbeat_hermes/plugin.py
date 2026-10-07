@@ -32,7 +32,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
-from .startup import GatewayWaiter, load_startup_timeout
+from .startup import GatewayWaiter, gateway_start_requested, load_startup_timeout
 
 if TYPE_CHECKING:
     from gateway.run import GatewayRunner
@@ -110,11 +110,11 @@ def _resolve_gateway() -> tuple[GatewayRunner, asyncio.AbstractEventLoop] | None
     if _gateway_runner is not None and _gateway_loop is not None:
         return _gateway_runner, _gateway_loop
     try:
-        from gateway import run
+        run = sys.modules.get("gateway.run")
 
-        reference = getattr(run, "_gateway_runner_ref", None)
+        reference: Callable[[], GatewayRunner | None] | None = getattr(run, "_gateway_runner_ref", None)
         runner = reference() if callable(reference) else None
-        if not isinstance(runner, run.GatewayRunner):
+        if run is None or runner is None or not isinstance(runner, run.GatewayRunner):
             return None
         loop = getattr(runner, "_gateway_loop", None)
         if loop is None or not loop.is_running():
@@ -589,7 +589,7 @@ def register(ctx: Any) -> None:
         _routing = _pinned_routing
     _register_tools(ctx.register_tool)
     ctx.register_hook("pre_gateway_dispatch", _capture_gateway)
-    if sys.modules.get("gateway.run") is not None:
+    if sys.modules.get("gateway.run") is not None or gateway_start_requested(sys.argv[1:]):
         with _scheduler_start_lock:
             if _startup_waiter is None:
                 _startup_waiter = GatewayWaiter(load_startup_timeout(), POLL_SECONDS)
