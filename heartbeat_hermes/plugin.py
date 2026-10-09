@@ -1,38 +1,30 @@
-"""Generic wake-on-done heartbeat for Hermes.
+"""Thin heartbeat adapter plugin for Hermes.
 
-Watches anything that can produce a "done": timers, check commands, process
-exits, external session state. When a watch fires, the agent is woken in its
-main session through a synthetic internal MessageEvent. The plugin never
-posts to any chat itself; the agent investigates and answers itself.
+The plugin owns registration and trusted binding only. One heartbeat-core
+child over stdio owns scheduling, durable policy and the tool semantics; the
+agent's tools are exactly Core's `tool_schema`, forwarded unchanged.
 
-Watch types:
-
-- ``timer``: one-shot. Fires once ``seconds`` have elapsed since creation.
-- ``command``: recurring. Runs a shell check command every ``interval``
-  seconds; empty stdout means "nothing", non-empty stdout is the finding
-  that wakes the agent. With ``once: true`` the watch is removed after the
-  first fire.
-
-The wake path reuses the gateway's own synthetic-event pipeline: a
-``MessageEvent(internal=True)`` is handed to the captured gateway runner,
-which routes it through normal dispatch into the agent's active session.
+Delivery is one internal synthetic event per offered envelope through the
+captured gateway runner, with a synthetic author, no gateway control, a
+strict current-session fence and an explicit delivery receipt. The plugin
+never composes or relays chat text; the agent's own reply leaves through the
+normal egress path. Startup needs no inbound message: the runner is captured
+at initialization through the pinned private seam and readiness is bounded.
 """
 
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import json
 import logging
 import os
-import subprocess
 import sys
 import threading
-import time
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
-from .startup import GatewayWaiter, gateway_start_requested, load_startup_timeout
+from .adapter import PLUGIN_INJECTION_TAG, HeartbeatAdapter
+from .core_client import CoreChild
 
 if TYPE_CHECKING:
     from gateway.run import GatewayRunner
@@ -40,56 +32,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 POLL_SECONDS = 5.0
-COMMAND_TIMEOUT_SECONDS = 120.0
-TIMER_MIN_INTERVAL = 5
 STATE_DIRNAME = "heartbeat"
-WATCHES_FILENAME = "watches.json"
-LOCK_FILENAME = "scheduler.lock"
 
 _gateway_runner: Any = None
 _gateway_loop: Any = None
-_routing: Optional[Dict[str, Any]] = None
-_pinned_routing: Optional[Dict[str, Any]] = None
-_owns_scheduler_lock = False
-_scheduler_thread: Optional[threading.Thread] = None
-_scheduler_stop = threading.Event()
-_scheduler_lock_fd: Any = None
-_state_lock = threading.Lock()
-_scheduler_start_lock = threading.RLock()
+_routing: dict[str, Any] | None = None
+_pinned_routing: dict[str, Any] | None = None
+_startup_waiter: Any = None
+_adapter: HeartbeatAdapter | None = None
+_schema: dict[str, Any] = {}
+_registration_lock = threading.Lock()
 _runner_warning_active = False
-_startup_waiter: GatewayWaiter | None = None
 
 
 # ---------------------------------------------------------------------------
-# State
-# ---------------------------------------------------------------------------
-
-
-def _state_dir() -> Path:
-    home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
-    path = Path(home) / STATE_DIRNAME
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _load_watches() -> Dict[str, Dict[str, Any]]:
-    try:
-        data = json.loads((_state_dir() / WATCHES_FILENAME).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _save_watches_locked(watches: Dict[str, Dict[str, Any]]) -> None:
-    """Write watches atomically. Caller must hold ``_state_lock``."""
-    target = _state_dir() / WATCHES_FILENAME
-    tmp = target.with_suffix(".tmp")
-    tmp.write_text(json.dumps(watches, indent=2), encoding="utf-8")
-    tmp.replace(target)
-
-
-# ---------------------------------------------------------------------------
-# Wake injection
+# Gateway capture (pinned private seam, contract-tested)
 # ---------------------------------------------------------------------------
 
 
@@ -102,16 +59,11 @@ def _resolve_adapter(runner: Any, platform_value: str) -> Any:
 
 
 def _resolve_gateway() -> tuple[GatewayRunner, asyncio.AbstractEventLoop] | None:
-    """Prefer hook capture; compatibility fallback uses Hermes' private runner ref/loop.
-
-    Hermes exposes no runner-bearing startup hook. Keep private startup access
-    here so a missing reference or a not-yet-running loop leaves wakes pending.
-    """
+    """Prefer hook capture; fallback uses Hermes' private runner ref/loop."""
     if _gateway_runner is not None and _gateway_loop is not None:
         return _gateway_runner, _gateway_loop
     try:
         run = sys.modules.get("gateway.run")
-
         reference: Callable[[], GatewayRunner | None] | None = getattr(run, "_gateway_runner_ref", None)
         runner = reference() if callable(reference) else None
         if run is None or runner is None or not isinstance(runner, run.GatewayRunner):
@@ -122,221 +74,6 @@ def _resolve_gateway() -> tuple[GatewayRunner, asyncio.AbstractEventLoop] | None
         return runner, loop
     except (ImportError, AttributeError, TypeError):
         return None
-
-
-def _inject_wake(text: str) -> bool:
-    """Hand a synthetic internal event to the available gateway runner."""
-    global _runner_warning_active
-    gateway = _resolve_gateway()
-    if gateway is None or not _routing:
-        if not _runner_warning_active:
-            logger.warning("heartbeat: gateway/routing unavailable, wake pending")
-            _runner_warning_active = True
-        return False
-    _runner_warning_active = False
-    runner, loop = gateway
-    try:
-        from gateway.config import Platform
-        from gateway.platforms.base import MessageEvent, MessageType
-        from gateway.session import SessionSource
-
-        platform_value = str(_routing.get("platform", ""))
-        try:
-            platform = Platform(platform_value)
-        except ValueError:
-            logger.error("heartbeat: unknown platform %r", platform_value)
-            return False
-
-        source = SessionSource(
-            platform=platform,
-            chat_id=str(_routing.get("chat_id", "")),
-            chat_name=_routing.get("chat_name"),
-            chat_type=_routing.get("chat_type", "dm"),
-            user_id="system:heartbeat",
-            user_name="heartbeat",
-            thread_id=_routing.get("thread_id"),
-        )
-        event = MessageEvent(
-            text=text,
-            message_type=MessageType.TEXT,
-            source=source,
-            internal=True,
-        )
-        adapter = _resolve_adapter(runner, platform_value)
-        if adapter is None:
-            logger.error("heartbeat: no adapter for platform %r", platform_value)
-            return False
-
-        if not callable(getattr(runner, "_handle_message", None)):
-            logger.error("heartbeat: captured gateway runner has no message handler")
-            return False
-
-        async def _deliver() -> None:
-            response_text = await runner._handle_message(event)
-            if response_text:
-                send_metadata = {"thread_id": source.thread_id} if source.thread_id else None
-                await adapter.send(
-                    chat_id=source.chat_id,
-                    content=response_text,
-                    metadata=send_metadata,
-                )
-
-        future = asyncio.run_coroutine_threadsafe(_deliver(), loop)
-        future.result(timeout=15)
-        logger.info("heartbeat: wake delivered: %s", text[:80])
-        return True
-    except Exception as exc:  # noqa: BLE001 - wake must never kill the scheduler
-        logger.error("heartbeat: wake injection failed: %s", exc)
-        return False
-
-
-# ---------------------------------------------------------------------------
-# Watch evaluation
-# ---------------------------------------------------------------------------
-
-
-def _run_check(command: str, timeout: float) -> str:
-    try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        logger.warning("heartbeat: check command failed: %s", exc)
-        return ""
-    return (result.stdout or "").strip()
-
-
-def evaluate_watch(
-    name: str,
-    watch: Dict[str, Any],
-    now: float,
-    wake: Callable[[str], bool] = _inject_wake,
-    runner: Callable[[str, float], str] = _run_check,
-) -> str:
-    """Evaluate one due watch. Returns "remove", "fired" or "pending"."""
-    kind = watch.get("type", "command")
-    if kind == "timer":
-        if now < float(watch.get("deadline", 0)):
-            return "pending"
-        note = str(watch.get("note") or f"Timer '{name}' expired.")
-        text = str(watch.get("pending_finding") or f"[heartbeat: {name}] {note}")
-        if not wake(text):
-            watch["pending_finding"] = text
-            return "pending"
-        watch.pop("pending_finding", None)
-        if watch.get("repeat"):
-            watch["deadline"] = now + float(watch.get("seconds", 60))
-            return "fired"
-        return "remove"
-
-    text = watch.get("pending_finding")
-    if not text:
-        finding = runner(str(watch.get("command", "")), float(watch.get("timeout", COMMAND_TIMEOUT_SECONDS)))
-        if not finding:
-            return "pending"
-        text = f"[heartbeat: {name}] {finding}"
-    if wake(str(text)):
-        watch.pop("pending_finding", None)
-        return "remove" if watch.get("once") else "fired"
-    watch["pending_finding"] = text
-    return "pending"
-
-
-# ---------------------------------------------------------------------------
-# Scheduler
-# ---------------------------------------------------------------------------
-
-
-def _scheduler_loop() -> None:
-    logger.info("heartbeat: scheduler started")
-    while not _scheduler_stop.is_set():
-        now = time.time()
-        with _state_lock:
-            watches = _load_watches()
-            due_watches = []
-            for name, watch in watches.items():
-                if not isinstance(watch, dict) or not watch.get("enabled", True):
-                    continue
-                if now < float(watch.get("next_run", 0)):
-                    continue
-                due_watches.append((name, dict(watch)))
-
-        evaluated = []
-        for name, original_watch in due_watches:
-            watch = dict(original_watch)
-            outcome = evaluate_watch(name, watch, now)
-            evaluated.append((name, original_watch, watch, outcome))
-
-        if evaluated:
-            with _state_lock:
-                watches = _load_watches()
-                dirty = False
-                for name, original_watch, watch, outcome in evaluated:
-                    if watches.get(name) != original_watch:
-                        continue
-                    if outcome == "remove":
-                        del watches[name]
-                    else:
-                        delay = POLL_SECONDS if watch.get("pending_finding") else float(watch.get("interval", 60))
-                        watch["next_run"] = now + delay
-                        watches[name] = watch
-                    dirty = True
-                if dirty:
-                    _save_watches_locked(watches)
-        _scheduler_stop.wait(POLL_SECONDS)
-    logger.info("heartbeat: scheduler stopped")
-
-
-def _try_acquire_scheduler_lock() -> bool:
-    global _scheduler_lock_fd
-    try:
-        _scheduler_lock_fd = open(_state_dir() / LOCK_FILENAME, "w", encoding="utf-8")
-        fcntl.flock(_scheduler_lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return True
-    except OSError:
-        if _scheduler_lock_fd:
-            _scheduler_lock_fd.close()
-            _scheduler_lock_fd = None
-        return False
-
-
-def _ensure_scheduler() -> None:
-    global _scheduler_thread
-    with _scheduler_start_lock:
-        if not _owns_scheduler_lock:
-            return
-        if _scheduler_thread and _scheduler_thread.is_alive():
-            return
-        _scheduler_stop.clear()
-        _scheduler_thread = threading.Thread(
-            target=_scheduler_loop,
-            name="heartbeat-scheduler",
-            daemon=True,
-        )
-        _scheduler_thread.start()
-
-
-def _claim_scheduler_if_available() -> bool:
-    global _owns_scheduler_lock
-    with _scheduler_start_lock:
-        if _owns_scheduler_lock:
-            _ensure_scheduler()
-            return True
-        if not _try_acquire_scheduler_lock():
-            return False
-        _owns_scheduler_lock = True
-        _ensure_scheduler()
-        return True
-
-
-# ---------------------------------------------------------------------------
-# Hook: capture gateway runner, loop, and routing
-# ---------------------------------------------------------------------------
 
 
 def _capture_gateway(**kwargs: Any) -> None:
@@ -352,222 +89,155 @@ def _capture_gateway(**kwargs: Any) -> None:
                 _gateway_loop = asyncio.get_event_loop()
             except RuntimeError:
                 _gateway_loop = None
-        _claim_scheduler_if_available()
         logger.info("heartbeat: captured gateway runner")
 
     if _pinned_routing is not None:
         _routing = _pinned_routing
+    elif _routing is None:
+        source = getattr(kwargs.get("event"), "source", None)
+        if source is not None:
+            platform = getattr(source, "platform", None)
+            _routing = {
+                "platform": platform.value if platform is not None and hasattr(platform, "value") else str(platform or ""),
+                "chat_id": getattr(source, "chat_id", "") or "",
+                "chat_name": getattr(source, "chat_name", None),
+                "chat_type": getattr(source, "chat_type", "dm") or "dm",
+                "thread_id": getattr(source, "thread_id", None),
+            }
+
+    if _adapter is not None and kwargs.get("event") is not None:
+        _adapter.on_gateway_event(kwargs["event"])
+
+
+# ---------------------------------------------------------------------------
+# Real gateway seams for the adapter
+# ---------------------------------------------------------------------------
+
+
+def _build_event(
+    *, text: str, routing: dict[str, Any], session_key: str, session_id: str
+) -> tuple[Any, Callable[[], Any]]:
+    from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.receipts import DeliveryReceipt
+    from gateway.session import SessionSource
+
+    try:
+        from gateway.config import Platform
+
+        platform = Platform(str(routing.get("platform", "")))
+    except (ImportError, ValueError) as exc:
+        raise RuntimeError(f"heartbeat: unknown platform {routing.get('platform')!r}") from exc
+
+    source = SessionSource(
+        platform=platform,
+        chat_id=str(routing.get("chat_id", "")),
+        chat_name=routing.get("chat_name"),
+        chat_type=routing.get("chat_type", "dm"),
+        user_id="system:heartbeat",
+        user_name="heartbeat",
+        thread_id=routing.get("thread_id"),
+    )
+    receipt = DeliveryReceipt()
+    event = MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=source,
+        internal=True,
+    )
+    event.allow_gateway_control = False
+    event.receipt = receipt
+    metadata = dict(event.metadata or {}) if hasattr(event, "metadata") else {}
+    metadata.update(
+        {
+            "hermes_plugin_injection": PLUGIN_INJECTION_TAG,
+            "gateway_session_key": session_key,
+            "gateway_session_id": session_id,
+            "gateway_session_strict": True,
+            "notification_category": "heartbeat",
+        }
+    )
+    event.metadata = metadata
+    return event, receipt.wait
+
+
+def _session_binding(runner: Any, routing: dict[str, Any]) -> tuple[str, str] | None:
+    adapter = _resolve_adapter(runner, str(routing.get("platform", "")))
+    if adapter is None:
+        return None
+    probe = getattr(runner, "_session_key_for_source", None)
+    store = getattr(runner, "session_store", None)
+    if not callable(probe) or store is None:
+        return None
+    try:
+        from gateway.config import Platform
+        from gateway.session import SessionSource
+
+        source = SessionSource(
+            platform=Platform(str(routing.get("platform", ""))),
+            chat_id=str(routing.get("chat_id", "")),
+            chat_name=routing.get("chat_name"),
+            chat_type=routing.get("chat_type", "dm"),
+            user_id="system:heartbeat",
+            user_name="heartbeat",
+            thread_id=routing.get("thread_id"),
+        )
+        session_key = probe(source)
+        if not isinstance(session_key, str) or not session_key:
+            return None
+        entry = store.lookup_by_session_key(session_key)
+        session_id = getattr(entry, "session_id", None) if entry is not None else None
+        if not isinstance(session_id, str) or not session_id:
+            return None
+        return session_key, session_id
+    except Exception as exc:  # noqa: BLE001 - held delivery beats a wrong binding
+        logger.warning("heartbeat: session binding unresolved: %s", exc)
         return None
 
-    event = kwargs.get("event")
-    source = getattr(event, "source", None)
-    if source is None:
-        return None
-    if _routing is not None:
-        return None
-    platform = getattr(source, "platform", None)
-    _routing = {
-        "platform": platform.value if platform is not None and hasattr(platform, "value") else str(platform or ""),
-        "chat_id": getattr(source, "chat_id", "") or "",
-        "chat_name": getattr(source, "chat_name", None),
-        "chat_type": getattr(source, "chat_type", "dm") or "dm",
-        "thread_id": getattr(source, "thread_id", None),
-    }
-    return None
+
+def _wrap_egress(
+    runner: Any, on_outbound: Callable[[str, str], None] | None
+) -> Callable[[], None]:
+    """Capture native outbound message ids for the bound route; returns unwrap."""
+    adapter = _resolve_adapter(runner, str((_routing or {}).get("platform", "")))
+    if adapter is None or on_outbound is None or "send" not in vars(type(adapter)):
+        return lambda: None
+    original = adapter.send
+
+    async def send_with_receipt(*args: Any, **kwargs: Any) -> Any:
+        result = await original(*args, **kwargs)
+        chat_id = kwargs.get("chat_id", args[0] if args else None)
+        message_id = getattr(result, "message_id", None) or (result or {}) if isinstance(result, dict) else None
+        if chat_id is not None and message_id:
+            on_outbound(str(chat_id), str(message_id))
+        return result
+
+    adapter.send = send_with_receipt
+
+    def unwrap() -> None:
+        if getattr(adapter, "send", None) is send_with_receipt:
+            adapter.send = original
+
+    return unwrap
 
 
 # ---------------------------------------------------------------------------
-# Tools
+# Configuration
 # ---------------------------------------------------------------------------
 
 
-def heartbeat_watch_tool(
-    name: str,
-    command: str = "",
-    interval: float = 60,
-    seconds: float = 0,
-    note: str = "",
-    once: bool = False,
-    repeat: bool = False,
-) -> str:
-    if not name or not name.strip():
-        return json.dumps({"error": "name is required"})
-    name = name.strip()
-    now = time.time()
-
-    if seconds and seconds > 0:
-        watch: Dict[str, Any] = {
-            "type": "timer",
-            "deadline": now + float(seconds),
-            "seconds": float(seconds),
-            "interval": max(TIMER_MIN_INTERVAL, min(60, float(seconds) / 10)),
-            "note": note or f"Timer '{name}' expired.",
-            "repeat": bool(repeat),
-            "enabled": True,
-            "next_run": now,
-        }
-    else:
-        if not command.strip():
-            return json.dumps({"error": "command is required for command watches (or pass seconds>0 for a timer)"})
-        if command.strip().split(maxsplit=1)[0].startswith("mcp__"):
-            return json.dumps(
-                {"error": "command must be a shell command, not an MCP tool name; use a real executable or script"}
-            )
-        watch = {
-            "type": "command",
-            "command": command,
-            "interval": max(5, float(interval)),
-            "once": bool(once),
-            "note": note,
-            "enabled": True,
-            "next_run": now,
-        }
-    with _state_lock:
-        watches = _load_watches()
-        watches[name] = watch
-        _save_watches_locked(watches)
-    _ensure_scheduler()
-    return json.dumps({"status": "watching", "name": name, "watch": watch})
-
-
-def heartbeat_unwatch_tool(name: str) -> str:
-    with _state_lock:
-        watches = _load_watches()
-        if name not in watches:
-            return json.dumps({"error": f"watch '{name}' not found"})
-        del watches[name]
-        _save_watches_locked(watches)
-    return json.dumps({"status": "removed", "name": name})
-
-
-def heartbeat_list_tool() -> str:
-    watches = _load_watches()
-    now = time.time()
-    out = []
-    for name, watch in watches.items():
-        entry = {
-            "name": name,
-            "type": watch.get("type", "command"),
-            "enabled": watch.get("enabled", True),
-            "interval": watch.get("interval"),
-        }
-        if watch.get("type") == "timer":
-            entry["fires_in_seconds"] = max(0, int(float(watch.get("deadline", 0)) - now))
-        out.append(entry)
-    return json.dumps({"watches": out, "count": len(out)}, indent=2)
-
-
-# ---------------------------------------------------------------------------
-# Registration
-# ---------------------------------------------------------------------------
-
-
-def _register_tools(register_tool: Callable[..., Any]) -> None:
-    register_tool(
-        name="heartbeat_watch",
-        handler=lambda args, **kw: heartbeat_watch_tool(
-            name=args.get("name", ""),
-            command=args.get("command", ""),
-            interval=args.get("interval", 60),
-            seconds=args.get("seconds", 0),
-            note=args.get("note", ""),
-            once=args.get("once", False),
-            repeat=args.get("repeat", False),
-        ),
-        schema={
-            "name": "heartbeat_watch",
-            "description": (
-                "Watch anything that can produce a done. Either a one-shot timer "
-                "(seconds>0, optionally with note) or a recurring check command "
-                "(empty stdout = nothing; non-empty stdout = finding that wakes "
-                "the agent in its main session)."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Unique watch name."},
-                    "command": {
-                        "type": "string",
-                        "description": "Shell check command for command watches. Prints the finding when done, nothing otherwise.",
-                    },
-                    "interval": {
-                        "type": "number",
-                        "description": "Seconds between command checks (default 60).",
-                    },
-                    "seconds": {
-                        "type": "number",
-                        "description": "One-shot timer duration in seconds. If > 0, creates a timer instead of a command watch.",
-                    },
-                    "note": {"type": "string", "description": "Optional custom wake text."},
-                    "once": {
-                        "type": "boolean",
-                        "description": "Remove a command watch after its first fire (default false).",
-                    },
-                    "repeat": {
-                        "type": "boolean",
-                        "description": "Re-arm a timer after each fire instead of removing it (default false).",
-                    },
-                },
-                "required": ["name"],
-            },
-        },
-        toolset="heartbeat",
-        description="Watch anything that can produce a done; wake the agent when it happens.",
-        emoji="⏰",
-        check_fn=lambda: True,
-    )
-    register_tool(
-        name="heartbeat_unwatch",
-        handler=lambda args, **kw: heartbeat_unwatch_tool(name=args.get("name", "")),
-        schema={
-            "name": "heartbeat_unwatch",
-            "description": "Remove a heartbeat watch by name.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Watch name to remove."},
-                },
-                "required": ["name"],
-            },
-        },
-        toolset="heartbeat",
-        description="Remove a heartbeat watch.",
-        emoji="🛑",
-        check_fn=lambda: True,
-    )
-    register_tool(
-        name="heartbeat_list",
-        handler=lambda args, **kw: heartbeat_list_tool(),
-        schema={
-            "name": "heartbeat_list",
-            "description": "List all heartbeat watches with their type, interval, and state.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-        toolset="heartbeat",
-        description="List all heartbeat watches.",
-        emoji="📋",
-        check_fn=lambda: True,
-    )
-
-
-def _load_pinned_routing() -> Optional[Dict[str, Any]]:
-    """Resolve an explicit wake target from config.yaml or env, if any.
-
-    Keys under ``plugins.entries.heartbeat-hermes`` (or the matching env
-    vars): ``deliver_platform``, ``deliver_chat_id``, ``deliver_chat_type``,
-    ``deliver_thread_id``. When unset, the wake target is the first
-    conversation the gateway routes through the plugin.
-    """
-    cfg: Dict[str, Any] = {}
+def _plugin_config() -> dict[str, Any]:
     try:
         from hermes_cli.config import load_config
 
         raw = (load_config() or {}).get("plugins", {}).get("entries", {}).get("heartbeat-hermes", {})
-        if isinstance(raw, dict):
-            cfg = raw
-    except Exception:
-        cfg = {}
+        return raw if isinstance(raw, dict) else {}
+    except Exception:  # noqa: BLE001 - config absence disables, never crashes
+        return {}
 
+
+def _load_pinned_routing() -> dict[str, Any] | None:
+    """Resolve an explicit wake target from config.yaml or env, if any."""
+    cfg = _plugin_config()
     platform = os.environ.get("HEARTBEAT_DELIVER_PLATFORM") or cfg.get("deliver_platform")
     chat_id = os.environ.get("HEARTBEAT_DELIVER_CHAT_ID") or cfg.get("deliver_chat_id")
     if not platform or not chat_id:
@@ -581,19 +251,124 @@ def _load_pinned_routing() -> Optional[Dict[str, Any]]:
     }
 
 
+def _start_adapter() -> bool:
+    """Start the Core child and the delivery loop after gateway readiness."""
+    global _adapter, _schema
+    if _adapter is not None:
+        return True
+    cfg = _plugin_config()
+    binary = os.environ.get("HEARTBEAT_CORE_BINARY") or cfg.get("core_binary")
+    config_path = os.environ.get("HEARTBEAT_CORE_CONFIG") or cfg.get("core_config")
+    if not binary or not config_path:
+        logger.warning(
+            "heartbeat: core_binary/core_config unset; adapter stays inactive "
+            "(set plugins.entries.heartbeat-hermes.core_binary and .core_config)"
+        )
+        return False
+    if _routing is None:
+        logger.warning("heartbeat: no bound route; adapter stays inactive")
+        return False
+    try:
+        core = CoreChild(str(binary), str(config_path))
+        _schema = core.request("tool_schema", {})
+    except Exception as exc:  # noqa: BLE001 - visible failure, no half-owner
+        logger.error("heartbeat: core child failed to start: %s", exc)
+        return False
+
+    _adapter = HeartbeatAdapter(
+        core=core,
+        routing=_routing,
+        resolve_gateway=_resolve_gateway,
+        build_event=_build_event,
+        session_binding=_session_binding,
+        send_admission=lambda outcome, batch: core.request(
+            "admission", {"batch": batch, "outcome": outcome}
+        ),
+        wrap_egress=_wrap_egress,
+        poll_seconds=POLL_SECONDS,
+    )
+    _adapter.start()
+    logger.info("heartbeat: adapter started over the core child")
+    return True
+
+
+def _register_tools(register_tool: Callable[..., Any]) -> None:
+    for tool in (_schema or {}).get("tools", []):
+        name = str(tool.get("name", ""))
+        if not name:
+            continue
+
+        def handler(args: dict[str, Any], _name: str = name, **_: Any) -> str:
+            assert _adapter is not None
+            external = _adapter.is_external_turn()
+            try:
+                result = _adapter.run_tool(_name, args, external)
+            except Exception as exc:  # noqa: BLE001 - tool surface returns errors as data
+                return json.dumps({"error": str(exc)})
+            return json.dumps(result)
+
+        register_tool(
+            name=name,
+            handler=handler,
+            schema=tool,
+            toolset="heartbeat",
+            description=str(tool.get("description", name)),
+            check_fn=lambda: True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
+
+
+def _on_pre_llm_call(**kwargs: Any) -> None:
+    if _adapter is None:
+        return
+    _adapter.on_pre_llm_call(
+        session_id=str(kwargs.get("session_id") or ""),
+        task_id=str(kwargs.get("task_id") or kwargs.get("turn_id") or ""),
+        user_message=kwargs.get("user_message"),
+    )
+    return
+
+
+def _on_post_gateway_admission(**kwargs: Any) -> None:
+    if _adapter is None:
+        return
+    source = kwargs.get("source") or {}
+    if not isinstance(source, dict):
+        return
+    _adapter.on_owner_turn_admitted(type("Source", (), source)())
+    return
+
+
 def register(ctx: Any) -> None:
-    """Register heartbeat tools and the gateway-capture hook."""
+    """Register heartbeat tools and gateway hooks; start needs no inbound."""
     global _pinned_routing, _routing, _startup_waiter
     _pinned_routing = _load_pinned_routing()
     if _pinned_routing is not None:
         _routing = _pinned_routing
-    _register_tools(ctx.register_tool)
-    ctx.register_hook("pre_gateway_dispatch", _capture_gateway)
+
+    from .startup import GatewayWaiter, gateway_start_requested, load_startup_timeout
+
+    def ready() -> bool:
+        return _resolve_gateway() is not None
+
+    def claim() -> bool:
+        return _start_adapter()
+
     if sys.modules.get("gateway.run") is not None or gateway_start_requested(sys.argv[1:]):
-        with _scheduler_start_lock:
+        with _registration_lock:
             if _startup_waiter is None:
-                _startup_waiter = GatewayWaiter(load_startup_timeout(), POLL_SECONDS)
-                _startup_waiter.start(
-                    lambda: _resolve_gateway() is not None, _claim_scheduler_if_available
-                )
+                if ready():
+                    claim()
+                else:
+                    _startup_waiter = GatewayWaiter(load_startup_timeout(), POLL_SECONDS)
+                    _startup_waiter.start(ready, claim)
+
+    ctx.register_hook("pre_gateway_dispatch", _capture_gateway)
+    ctx.register_hook("pre_llm_call", _on_pre_llm_call)
+    ctx.register_hook("post_gateway_admission", _on_post_gateway_admission)
+    _register_tools(ctx.register_tool)
     logger.info("heartbeat plugin registered")
