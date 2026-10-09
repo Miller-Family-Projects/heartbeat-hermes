@@ -1,6 +1,8 @@
 name: heartbeat-hermes
-version: "0.1.0"
-description: "Generic wake-on-done watcher: timers and check commands for any task that can produce a done. Wakes the agent in its main session via a synthetic internal event; the plugin never posts to chat itself."
+version: "0.2.0"
+description: "Thin adapter over one heartbeat-core child: the Core owns scheduling, durable policy and the agent tools; the plugin owns registration, trusted route binding, native delivery and receipts. Wakes arrive as internal synthetic events with explicit delivery receipts; the plugin never composes chat text."
 author: "heartbeat-hermes contributors"
 hooks:
   - pre_gateway_dispatch
+  - pre_llm_call
+  - post_gateway_admission

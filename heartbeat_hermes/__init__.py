@@ -1,4 +1,4 @@
-"""heartbeat-hermes: generic wake-on-done watcher plugin for Hermes."""
+"""heartbeat-hermes: thin adapter over one heartbeat-core child for Hermes."""
 
 from .plugin import register
 
