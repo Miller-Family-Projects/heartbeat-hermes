@@ -187,9 +187,7 @@ def make_adapter(
             "gateway_session_strict": True,
             "hermes_plugin_injection": "heartbeat-hermes",
         }
-        receipt = FakeReceipt(FakeOutcome(receipt_status))
-        event.receipt = receipt
-        return event, receipt.wait
+        return event
 
     admissions: list[dict[str, Any]] = []
 
@@ -201,6 +199,7 @@ def make_adapter(
         session_binding=lambda runner, routing: ("matrix:dm:room", "session-1"),
         send_admission=lambda outcome, batch: admissions.append({"outcome": outcome, "batch": batch}),
         wrap_egress=lambda runner, on_outbound: (setattr(runner, "_on_outbound", on_outbound) or (lambda: None)),
+        receipt_factory=lambda: FakeReceipt(FakeOutcome(receipt_status)),
         poll_seconds=0.01,
     )
     return adapter, admissions

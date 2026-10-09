@@ -43,9 +43,10 @@ class HeartbeatAdapter:
         routing: dict[str, Any],
         resolve_gateway: Callable[[], Any],
         build_event: Callable[..., Any],
-        session_binding: Callable[[Any, Any], tuple[str, str] | None],
+        session_binding: Callable[[Any, dict[str, Any]], tuple[str, str] | None],
         send_admission: Callable[[Any, dict[str, Any]], None],
         wrap_egress: Callable[[Any, Callable[[str, str], None] | None], Callable[[], None]],
+        receipt_factory: Callable[[], Any] | None = None,
         poll_seconds: float = 5.0,
     ) -> None:
         self._core = core
@@ -55,6 +56,7 @@ class HeartbeatAdapter:
         self._session_binding = session_binding
         self._send_admission = send_admission
         self._wrap_egress = wrap_egress
+        self._receipt_factory = receipt_factory
         self._poll_seconds = poll_seconds
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -182,7 +184,7 @@ class HeartbeatAdapter:
             return
         session_key, session_id = binding
         text = wrap_envelope(envelope)
-        event, await_receipt = self._build_event(
+        event = self._build_event(
             text=text,
             routing=self._routing,
             session_key=session_key,
@@ -191,7 +193,7 @@ class HeartbeatAdapter:
         batch = envelope["batch"]
         native_id = str(getattr(event, "message_id", None) or f"heartbeat-{batch}")
         self._inflight[session_key] = (batch, native_id)
-        accepted = self._inject(runner, loop, event, await_receipt, session_key, batch, native_id)
+        accepted = self._inject(runner, loop, event, session_key, batch, native_id)
         if accepted is not True:
             self._inflight.pop(session_key, None)
             return
@@ -239,17 +241,25 @@ class HeartbeatAdapter:
         runner: Any,
         loop: asyncio.AbstractEventLoop,
         event: Any,
-        await_receipt: Callable[[], Any],
         session_key: str,
         batch: Any,
         native_id: str,
     ) -> bool | None:
-        """Inject one internal event; the receipt, not None, decides acceptance."""
+        """Inject one internal event; the receipt, not None, decides acceptance.
+
+        The receipt is created here, on the gateway loop: the house receipt
+        seam binds to the running loop at construction.
+        """
 
         async def _deliver() -> Any:
+            receipt = self._receipt_factory() if self._receipt_factory is not None else None
+            if receipt is not None:
+                event.receipt = receipt
             response = await runner._handle_message(event)
+            if receipt is None:
+                return response, None
             outcome = await asyncio.wait_for(
-                await_receipt(), timeout=ADMISSION_TIMEOUT_SECONDS
+                receipt.wait(), timeout=ADMISSION_TIMEOUT_SECONDS
             )
             return response, outcome
 

@@ -114,11 +114,16 @@ def _capture_gateway(**kwargs: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _receipt_factory() -> Any:
+    from gateway.receipts import DeliveryReceipt
+
+    return DeliveryReceipt()
+
+
 def _build_event(
     *, text: str, routing: dict[str, Any], session_key: str, session_id: str
-) -> tuple[Any, Callable[[], Any]]:
+) -> Any:
     from gateway.platforms.base import MessageEvent, MessageType
-    from gateway.receipts import DeliveryReceipt
     from gateway.session import SessionSource
 
     try:
@@ -137,7 +142,6 @@ def _build_event(
         user_name="heartbeat",
         thread_id=routing.get("thread_id"),
     )
-    receipt = DeliveryReceipt()
     event = MessageEvent(
         text=text,
         message_type=MessageType.TEXT,
@@ -145,7 +149,6 @@ def _build_event(
         internal=True,
     )
     event.allow_gateway_control = False
-    event.receipt = receipt
     metadata = dict(event.metadata or {}) if hasattr(event, "metadata") else {}
     metadata.update(
         {
@@ -157,7 +160,7 @@ def _build_event(
         }
     )
     event.metadata = metadata
-    return event, receipt.wait
+    return event
 
 
 def _session_binding(runner: Any, routing: dict[str, Any]) -> tuple[str, str] | None:
@@ -285,6 +288,7 @@ def _start_adapter() -> bool:
             "admission", {"batch": batch, "outcome": outcome}
         ),
         wrap_egress=_wrap_egress,
+        receipt_factory=_receipt_factory,
         poll_seconds=POLL_SECONDS,
     )
     _adapter.start()
